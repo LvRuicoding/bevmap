@@ -70,20 +70,98 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
                 nn.init.constant_(module.bias, 0)
                 nn.init.constant_(module.weight, 1.0)
 
-    def apply_mapanything_cross_attn(self, x):
-        """Apply map-anything cross-attention on per-camera image features."""
-        _, num_views, _, _, _ = x.shape
-        features = [x[:, view_id].contiguous() for view_id in range(num_views)]
+    def apply_mapanything_cross_attn(self, img_feats):
+        """Apply cross-attention over all frames/views, then residual fuse."""
+        num_frame = len(img_feats)
+        b, n, c, h, w = img_feats[0].shape
+        feat_all = torch.cat(img_feats, dim=1)
+        total_views = feat_all.shape[1]
+        if total_views != self.mapanything_cross_attn.num_views:
+            raise ValueError(
+                f'Configured num_views={self.mapanything_cross_attn.num_views}, '
+                f'but got {total_views} views ({num_frame} frames x {n} cams).')
+        features = [feat_all[:, view_id].contiguous()
+                    for view_id in range(total_views)]
         output = self.mapanything_cross_attn(
             MultiViewTransformerInput(features=features))
-        return torch.stack(output.features, dim=1)
+        attn_all = torch.stack(output.features, dim=1)
+        feat_all = feat_all + attn_all
+        feat_all = feat_all.view(b, num_frame, n, c, h, w)
+        return [feat.contiguous() for feat in feat_all.unbind(dim=1)]
 
-    def prepare_bev_feat(self, img, rot, tran, intrin, post_rot, post_tran,
-                         bda, mlp_input):
-        x, _ = self.image_encoder(img)
-        x = self.apply_mapanything_cross_attn(x)
+    def forward_lss_from_feature(self, x, rot, tran, intrin, post_rot,
+                                 post_tran, bda, mlp_input):
+        x = x.contiguous()
         bev_feat, depth = self.img_view_transformer(
             [x, rot, tran, intrin, post_rot, post_tran, bda, mlp_input])
         if self.pre_process:
             bev_feat = self.pre_process_net(bev_feat)[0]
         return bev_feat, depth
+
+    def extract_img_feat(self,
+                         img,
+                         img_metas,
+                         pred_prev=False,
+                         sequential=False,
+                         **kwargs):
+        if sequential or pred_prev:
+            return super(BEVDet4DMapAnythingCrossAttn, self).extract_img_feat(
+                img, img_metas, pred_prev=pred_prev, sequential=sequential,
+                **kwargs)
+
+        imgs, sensor2keyegos, ego2globals, intrins, post_rots, post_trans, \
+        bda, _ = self.prepare_inputs(img)
+
+        img_feat_list = []
+        key_frame = True
+        for img_frame in imgs:
+            if key_frame or self.with_prev:
+                if key_frame:
+                    x, _ = self.image_encoder(img_frame)
+                else:
+                    with torch.no_grad():
+                        x, _ = self.image_encoder(img_frame)
+            else:
+                x = torch.zeros_like(img_feat_list[0])
+            img_feat_list.append(x)
+            key_frame = False
+
+        img_feat_list = self.apply_mapanything_cross_attn(img_feat_list)
+
+        bev_feat_list = []
+        depth_list = []
+        key_frame = True
+        for x, sensor2keyego, ego2global, intrin, post_rot, post_tran in zip(
+                img_feat_list, sensor2keyegos, ego2globals, intrins,
+                post_rots, post_trans):
+            if key_frame or self.with_prev:
+                if self.align_after_view_transfromation:
+                    sensor2keyego, ego2global = sensor2keyegos[0], ego2globals[0]
+                mlp_input = self.img_view_transformer.get_mlp_input(
+                    sensor2keyegos[0], ego2globals[0], intrin, post_rot,
+                    post_tran, bda)
+                inputs_curr = (x, sensor2keyego, ego2global, intrin, post_rot,
+                               post_tran, bda, mlp_input)
+                if key_frame:
+                    bev_feat, depth = self.forward_lss_from_feature(*inputs_curr)
+                else:
+                    with torch.no_grad():
+                        bev_feat, depth = self.forward_lss_from_feature(
+                            *inputs_curr)
+            else:
+                bev_feat = torch.zeros_like(bev_feat_list[0])
+                depth = None
+            bev_feat_list.append(bev_feat)
+            depth_list.append(depth)
+            key_frame = False
+
+        if self.align_after_view_transfromation:
+            for adj_id in range(1, self.num_frame):
+                bev_feat_list[adj_id] = \
+                    self.shift_feature(bev_feat_list[adj_id],
+                                       [sensor2keyegos[0],
+                                        sensor2keyegos[adj_id]],
+                                       bda)
+        bev_feat = torch.cat(bev_feat_list, dim=1)
+        x = self.bev_encoder(bev_feat)
+        return [x], depth_list[0]
