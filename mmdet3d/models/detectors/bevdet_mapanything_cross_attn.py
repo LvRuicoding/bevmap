@@ -45,7 +45,7 @@ def _ensure_sdpa_scale_compat():
 
 @DETECTORS.register_module()
 class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
-    """BEVDet4D with map-anything multi-view cross-attention before LSS."""
+    """Temporal cross-attn context, but single-frame LSS/BEV detection."""
 
     def __init__(self,
                  mapanything_cross_attn,
@@ -202,41 +202,18 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
         img_feat_list = self.apply_mapanything_cross_attn(
             img_feat_list, sensor2keyegos, ego2globals, intrins,
             post_rots, post_trans, bda)
-
-        bev_feat_list = []
-        depth_list = []
-        key_frame = True
-        for x, sensor2keyego, ego2global, intrin, post_rot, post_tran in zip(
-                img_feat_list, sensor2keyegos, ego2globals, intrins,
-                post_rots, post_trans):
-            if key_frame or self.with_prev:
-                if self.align_after_view_transfromation:
-                    sensor2keyego, ego2global = sensor2keyegos[0], ego2globals[0]
-                mlp_input = self.img_view_transformer.get_mlp_input(
-                    sensor2keyegos[0], ego2globals[0], intrin, post_rot,
-                    post_tran, bda)
-                inputs_curr = (x, sensor2keyego, ego2global, intrin, post_rot,
-                               post_tran, bda, mlp_input)
-                if key_frame:
-                    bev_feat, depth = self.forward_lss_from_feature(*inputs_curr)
-                else:
-                    with torch.no_grad():
-                        bev_feat, depth = self.forward_lss_from_feature(
-                            *inputs_curr)
-            else:
-                bev_feat = torch.zeros_like(bev_feat_list[0])
-                depth = None
-            bev_feat_list.append(bev_feat)
-            depth_list.append(depth)
-            key_frame = False
-
-        if self.align_after_view_transfromation:
-            for adj_id in range(1, self.num_frame):
-                bev_feat_list[adj_id] = \
-                    self.shift_feature(bev_feat_list[adj_id],
-                                       [sensor2keyegos[0],
-                                        sensor2keyegos[adj_id]],
-                                       bda)
-        bev_feat = torch.cat(bev_feat_list, dim=1)
+        # Only key-frame features enter LSS; history is used for cross-attn only.
+        x_key = img_feat_list[0]
+        sensor2keyego_key = sensor2keyegos[0]
+        ego2global_key = ego2globals[0]
+        intrin_key = intrins[0]
+        post_rot_key = post_rots[0]
+        post_tran_key = post_trans[0]
+        mlp_input = self.img_view_transformer.get_mlp_input(
+            sensor2keyegos[0], ego2globals[0], intrin_key, post_rot_key,
+            post_tran_key, bda)
+        bev_feat, depth = self.forward_lss_from_feature(
+            x_key, sensor2keyego_key, ego2global_key, intrin_key, post_rot_key,
+            post_tran_key, bda, mlp_input)
         x = self.bev_encoder(bev_feat)
-        return [x], depth_list[0]
+        return [x], depth
