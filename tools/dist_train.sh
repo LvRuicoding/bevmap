@@ -7,14 +7,27 @@ NODE_RANK=${NODE_RANK:-0}
 PORT=${PORT:-29500}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
-PYTHONPATH="$(dirname $0)/..":$PYTHONPATH \
-python -m torch.distributed.launch \
-    --nnodes=$NNODES \
-    --node_rank=$NODE_RANK \
-    --master_addr=$MASTER_ADDR \
-    --nproc_per_node=$GPUS \
-    --master_port=$PORT \
-    $(dirname "$0")/train.py \
-    $CONFIG \
-    --seed 0 \
-    --launcher pytorch ${@:3}
+export PYTHONPATH="$(dirname "$0")/..":$PYTHONPATH
+if command -v torchrun >/dev/null 2>&1; then
+    torchrun \
+        --nnodes=$NNODES \
+        --node_rank=$NODE_RANK \
+        --master_addr=$MASTER_ADDR \
+        --nproc_per_node=$GPUS \
+        --master_port=$PORT \
+        $(dirname "$0")/train.py \
+        $CONFIG \
+        --seed 0 \
+        --launcher pytorch ${@:3}
+else
+    python -m torch.distributed.run \
+        --nnodes=$NNODES \
+        --node_rank=$NODE_RANK \
+        --master_addr=$MASTER_ADDR \
+        --nproc_per_node=$GPUS \
+        --master_port=$PORT \
+        $(dirname "$0")/train.py \
+        $CONFIG \
+        --seed 0 \
+        --launcher pytorch ${@:3}
+fi

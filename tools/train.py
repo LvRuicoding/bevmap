@@ -93,7 +93,10 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    # Support both torch.distributed.launch (--local_rank) and
+    # torchrun/torch>=2.0 style (--local-rank).
+    parser.add_argument(
+        '--local_rank', '--local-rank', dest='local_rank', type=int, default=0)
     parser.add_argument(
         '--autoscale-lr',
         action='store_true',
