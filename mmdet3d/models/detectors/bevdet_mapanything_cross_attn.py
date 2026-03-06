@@ -2,6 +2,7 @@
 import inspect
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from mmdet.models import DETECTORS
 from uniception.models.info_sharing.base import MultiViewTransformerInput
@@ -49,8 +50,25 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
     def __init__(self, mapanything_cross_attn, **kwargs):
         super(BEVDet4DMapAnythingCrossAttn, self).__init__(**kwargs)
         _ensure_sdpa_scale_compat()
+        mapanything_cross_attn = dict(mapanything_cross_attn)
+        # Do not load any map-anything/uniception pretrained checkpoint.
+        mapanything_cross_attn['pretrained_checkpoint_path'] = None
+        force_random_init = mapanything_cross_attn.pop('force_random_init', True)
         self.mapanything_cross_attn = MultiViewCrossAttentionTransformer(
             **mapanything_cross_attn)
+        if force_random_init:
+            self._init_cross_attn_random()
+
+    def _init_cross_attn_random(self):
+        """Explicit random init for cross-attention branch."""
+        for module in self.mapanything_cross_attn.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.bias, 0)
+                nn.init.constant_(module.weight, 1.0)
 
     def apply_mapanything_cross_attn(self, x):
         """Apply map-anything cross-attention on per-camera image features."""
