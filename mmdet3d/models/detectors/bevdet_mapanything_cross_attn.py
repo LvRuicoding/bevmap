@@ -47,13 +47,33 @@ def _ensure_sdpa_scale_compat():
 class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
     """BEVDet4D with map-anything multi-view cross-attention before LSS."""
 
-    def __init__(self, mapanything_cross_attn, **kwargs):
+    def __init__(self,
+                 mapanything_cross_attn,
+                 explicit_geo_encoding=None,
+                 **kwargs):
         super(BEVDet4DMapAnythingCrossAttn, self).__init__(**kwargs)
         _ensure_sdpa_scale_compat()
         mapanything_cross_attn = dict(mapanything_cross_attn)
         # Do not load any map-anything/uniception pretrained checkpoint.
         mapanything_cross_attn['pretrained_checkpoint_path'] = None
         force_random_init = mapanything_cross_attn.pop('force_random_init', True)
+        self.cross_attn_embed_dim = mapanything_cross_attn['input_embed_dim']
+        geo_cfg = dict(
+            enabled=True,
+            include_ego2global=True,
+            hidden_dim=self.cross_attn_embed_dim)
+        if explicit_geo_encoding is not None:
+            geo_cfg.update(explicit_geo_encoding)
+        self.use_explicit_geo_encoding = geo_cfg['enabled']
+        self.include_ego2global = geo_cfg['include_ego2global']
+        geo_in_dim = 12 + 9 + 9 + 3 + 12
+        if self.include_ego2global:
+            geo_in_dim += 12
+        self.geo_encoder = nn.Sequential(
+            nn.LayerNorm(geo_in_dim),
+            nn.Linear(geo_in_dim, geo_cfg['hidden_dim']),
+            nn.ReLU(inplace=True),
+            nn.Linear(geo_cfg['hidden_dim'], self.cross_attn_embed_dim))
         self.mapanything_cross_attn = MultiViewCrossAttentionTransformer(
             **mapanything_cross_attn)
         if force_random_init:
@@ -69,23 +89,67 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
             elif isinstance(module, nn.LayerNorm):
                 nn.init.constant_(module.bias, 0)
                 nn.init.constant_(module.weight, 1.0)
+        for module in self.geo_encoder.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.constant_(module.bias, 0)
+                nn.init.constant_(module.weight, 1.0)
 
-    def apply_mapanything_cross_attn(self, img_feats):
+    def _build_geometry_vector(self, sensor2keyego, ego2global, intrin,
+                               post_rot, post_tran, bda):
+        b, n = sensor2keyego.shape[:2]
+        parts = [sensor2keyego[:, :, :3, :].reshape(b, n, -1)]
+        if self.include_ego2global:
+            parts.append(ego2global[:, :, :3, :].reshape(b, n, -1))
+        parts.extend([
+            intrin.reshape(b, n, -1),
+            post_rot[:, :, :3, :3].reshape(b, n, -1),
+            post_tran.reshape(b, n, -1),
+            bda[:, :3, :].reshape(b, 1, -1).expand(-1, n, -1),
+        ])
+        return torch.cat(parts, dim=-1)
+
+    def _encode_geometry(self, sensor2keyegos, ego2globals, intrins,
+                         post_rots, post_trans, bda, dtype):
+        if not self.use_explicit_geo_encoding:
+            return None
+        geo_feats = []
+        for sensor2keyego, ego2global, intrin, post_rot, post_tran in zip(
+                sensor2keyegos, ego2globals, intrins, post_rots, post_trans):
+            geo = self._build_geometry_vector(
+                sensor2keyego, ego2global, intrin, post_rot, post_tran, bda)
+            geo = self.geo_encoder(geo.float()).to(dtype=dtype)
+            geo_feats.append(geo.unsqueeze(-1).unsqueeze(-1))
+        return torch.cat(geo_feats, dim=1)
+
+    def apply_mapanything_cross_attn(self, img_feats, sensor2keyegos,
+                                     ego2globals, intrins, post_rots,
+                                     post_trans, bda):
         """Apply cross-attention over all frames/views, then residual fuse."""
         num_frame = len(img_feats)
         b, n, c, h, w = img_feats[0].shape
-        feat_all = torch.cat(img_feats, dim=1)
-        total_views = feat_all.shape[1]
+        feat_all_orig = torch.cat(img_feats, dim=1)
+        total_views = feat_all_orig.shape[1]
         if total_views != self.mapanything_cross_attn.num_views:
             raise ValueError(
                 f'Configured num_views={self.mapanything_cross_attn.num_views}, '
                 f'but got {total_views} views ({num_frame} frames x {n} cams).')
-        features = [feat_all[:, view_id].contiguous()
+
+        geo_all = self._encode_geometry(
+            sensor2keyegos, ego2globals, intrins, post_rots, post_trans, bda,
+            feat_all_orig.dtype)
+        feat_all_attn_input = feat_all_orig if geo_all is None else \
+            (feat_all_orig + geo_all)
+
+        features = [feat_all_attn_input[:, view_id].contiguous()
                     for view_id in range(total_views)]
         output = self.mapanything_cross_attn(
             MultiViewTransformerInput(features=features))
         attn_all = torch.stack(output.features, dim=1)
-        feat_all = feat_all + attn_all
+        feat_all = feat_all_orig + attn_all
         feat_all = feat_all.view(b, num_frame, n, c, h, w)
         return [feat.contiguous() for feat in feat_all.unbind(dim=1)]
 
@@ -126,7 +190,9 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
             img_feat_list.append(x)
             key_frame = False
 
-        img_feat_list = self.apply_mapanything_cross_attn(img_feat_list)
+        img_feat_list = self.apply_mapanything_cross_attn(
+            img_feat_list, sensor2keyegos, ego2globals, intrins,
+            post_rots, post_trans, bda)
 
         bev_feat_list = []
         depth_list = []
