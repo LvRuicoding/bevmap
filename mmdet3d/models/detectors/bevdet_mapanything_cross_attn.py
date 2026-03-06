@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from mmdet.models import DETECTORS
 from uniception.models.info_sharing.base import MultiViewTransformerInput
 from uniception.models.info_sharing.cross_attention_transformer import \
-    MultiViewCrossAttentionTransformer
+    MultiViewCrossAttentionTransformer, MultiViewCrossAttentionTransformerIFR
 
 from .bevdet import BEVDet4D
 
@@ -57,6 +57,7 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
         # Do not load any map-anything/uniception pretrained checkpoint.
         mapanything_cross_attn['pretrained_checkpoint_path'] = None
         force_random_init = mapanything_cross_attn.pop('force_random_init', True)
+        use_ifr = mapanything_cross_attn.pop('use_ifr', False)
         self.cross_attn_embed_dim = mapanything_cross_attn['input_embed_dim']
         geo_cfg = dict(
             enabled=True,
@@ -74,8 +75,12 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
             nn.Linear(geo_in_dim, geo_cfg['hidden_dim']),
             nn.ReLU(inplace=True),
             nn.Linear(geo_cfg['hidden_dim'], self.cross_attn_embed_dim))
-        self.mapanything_cross_attn = MultiViewCrossAttentionTransformer(
-            **mapanything_cross_attn)
+        if use_ifr:
+            self.mapanything_cross_attn = MultiViewCrossAttentionTransformerIFR(
+                **mapanything_cross_attn)
+        else:
+            self.mapanything_cross_attn = MultiViewCrossAttentionTransformer(
+                **mapanything_cross_attn)
         if force_random_init:
             self._init_cross_attn_random()
 
@@ -148,6 +153,10 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
                     for view_id in range(total_views)]
         output = self.mapanything_cross_attn(
             MultiViewTransformerInput(features=features))
+        if isinstance(output, tuple):
+            output = output[0]
+        elif isinstance(output, list):
+            output = output[-1]
         attn_all = torch.stack(output.features, dim=1)
         feat_all = feat_all_orig + attn_all
         feat_all = feat_all.view(b, num_frame, n, c, h, w)
