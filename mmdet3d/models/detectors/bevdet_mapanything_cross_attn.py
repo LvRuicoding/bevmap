@@ -6,10 +6,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from mmdet.models import DETECTORS
 from uniception.models.info_sharing.base import MultiViewTransformerInput
-from uniception.models.info_sharing.cross_attention_transformer import \
-    MultiViewCrossAttentionTransformer, MultiViewCrossAttentionTransformerIFR
 
 from .bevdet import BEVDet4D
+from .mapanything_cross_attention_token_aligned import \
+    MultiViewCrossAttentionTransformerIFRTokenAligned, \
+    MultiViewCrossAttentionTransformerTokenAligned
 
 
 def _ensure_sdpa_scale_compat():
@@ -58,7 +59,27 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
         mapanything_cross_attn['pretrained_checkpoint_path'] = None
         force_random_init = mapanything_cross_attn.pop('force_random_init', True)
         use_ifr = mapanything_cross_attn.pop('use_ifr', False)
+        self.use_ifr_intermediates = mapanything_cross_attn.pop(
+            'use_ifr_intermediates', True)
+        self.use_token_features = mapanything_cross_attn.pop(
+            'use_token_features', True)
+        self.use_scale_token = mapanything_cross_attn.pop(
+            'use_scale_token', self.use_token_features)
+        self.use_register_tokens = mapanything_cross_attn.pop(
+            'use_register_tokens', self.use_token_features)
+        self.num_register_tokens = int(
+            mapanything_cross_attn.pop('num_register_tokens', 4))
+        self.ifr_align_fusion = mapanything_cross_attn.pop(
+            'ifr_align_fusion', True)
         self.cross_attn_embed_dim = mapanything_cross_attn['input_embed_dim']
+        self.ifr_intermediate_count = self._infer_ifr_intermediate_count(
+            mapanything_cross_attn.get('indices', None),
+            mapanything_cross_attn.get('depth', None),
+            use_ifr)
+        # MapAnything DPT path: len(indices)==2 keeps encoder feature as extra level.
+        self.ifr_use_encoder_feature = self.ifr_intermediate_count == 2
+        self.ifr_fusion_num_terms = (
+            1 + self.ifr_intermediate_count + int(self.ifr_use_encoder_feature))
         geo_cfg = dict(
             enabled=True,
             include_ego2global=True,
@@ -75,20 +96,55 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
             nn.Linear(geo_in_dim, geo_cfg['hidden_dim']),
             nn.ReLU(inplace=True),
             nn.Linear(geo_cfg['hidden_dim'], self.cross_attn_embed_dim))
+        self.scale_token = None
+        if self.use_scale_token:
+            self.scale_token = nn.Parameter(torch.zeros(self.cross_attn_embed_dim))
+            nn.init.trunc_normal_(self.scale_token, std=0.02)
+        self.register_token_proj = None
+        if self.use_register_tokens and self.num_register_tokens > 0:
+            self.register_token_proj = nn.Sequential(
+                nn.LayerNorm(self.cross_attn_embed_dim),
+                nn.Linear(self.cross_attn_embed_dim,
+                          self.cross_attn_embed_dim * self.num_register_tokens))
+        self.ifr_fusion = None
+        if (use_ifr and self.use_ifr_intermediates and self.ifr_align_fusion and
+                self.ifr_intermediate_count > 0):
+            self.ifr_fusion = nn.Conv2d(
+                self.cross_attn_embed_dim * self.ifr_fusion_num_terms,
+                self.cross_attn_embed_dim,
+                kernel_size=1,
+                bias=True)
         if use_ifr:
-            self.mapanything_cross_attn = MultiViewCrossAttentionTransformerIFR(
-                **mapanything_cross_attn)
+            self.mapanything_cross_attn = \
+                MultiViewCrossAttentionTransformerIFRTokenAligned(
+                    **mapanything_cross_attn)
         else:
-            self.mapanything_cross_attn = MultiViewCrossAttentionTransformer(
-                **mapanything_cross_attn)
+            self.mapanything_cross_attn = \
+                MultiViewCrossAttentionTransformerTokenAligned(
+                    **mapanything_cross_attn)
         if force_random_init:
             self._init_cross_attn_random()
+
+    def _infer_ifr_intermediate_count(self, indices_cfg, depth_cfg, use_ifr):
+        if not use_ifr:
+            return 0
+        if isinstance(indices_cfg, list):
+            return len(indices_cfg)
+        if isinstance(indices_cfg, int):
+            return max(indices_cfg, 0)
+        if isinstance(depth_cfg, int):
+            return max(depth_cfg, 0)
+        return 0
 
     def _init_cross_attn_random(self):
         """Explicit random init for cross-attention branch."""
         for module in self.mapanything_cross_attn.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.Conv2d):
+                nn.init.kaiming_uniform_(module.weight, a=1)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
             elif isinstance(module, nn.LayerNorm):
@@ -102,6 +158,21 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
             elif isinstance(module, nn.LayerNorm):
                 nn.init.constant_(module.bias, 0)
                 nn.init.constant_(module.weight, 1.0)
+        if self.register_token_proj is not None:
+            for module in self.register_token_proj.modules():
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0)
+                elif isinstance(module, nn.LayerNorm):
+                    nn.init.constant_(module.bias, 0)
+                    nn.init.constant_(module.weight, 1.0)
+        if self.ifr_fusion is not None:
+            nn.init.kaiming_uniform_(self.ifr_fusion.weight, a=1)
+            if self.ifr_fusion.bias is not None:
+                nn.init.constant_(self.ifr_fusion.bias, 0)
+        if self.scale_token is not None:
+            nn.init.trunc_normal_(self.scale_token, std=0.02)
 
     def _build_geometry_vector(self, sensor2keyego, ego2global, intrin,
                                post_rot, post_tran, bda):
@@ -130,6 +201,72 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
             geo_feats.append(geo.unsqueeze(-1).unsqueeze(-1))
         return torch.cat(geo_feats, dim=1)
 
+    def _build_additional_tokens(self, feat_all_attn_input):
+        b, total_views, c, h, w = feat_all_attn_input.shape
+        scale_token = None
+        if self.scale_token is not None:
+            scale_token = self.scale_token.unsqueeze(0).unsqueeze(-1).expand(
+                b, -1, 1).to(
+                    device=feat_all_attn_input.device,
+                    dtype=feat_all_attn_input.dtype)
+        register_tokens = None
+        if self.register_token_proj is not None and self.num_register_tokens > 0:
+            pooled = F.adaptive_avg_pool2d(
+                feat_all_attn_input.reshape(b * total_views, c, h, w), 1)
+            pooled = pooled.reshape(b, total_views, c)
+            register_tokens = []
+            for view_id in range(total_views):
+                tokens = self.register_token_proj(
+                    pooled[:, view_id].float()).to(
+                        dtype=feat_all_attn_input.dtype)
+                tokens = tokens.view(
+                    b, c, self.num_register_tokens).contiguous()
+                register_tokens.append(tokens)
+        return scale_token, register_tokens
+
+    def _select_intermediate_outputs(self, intermediate_outputs):
+        if self.ifr_intermediate_count <= 0:
+            return []
+        if len(intermediate_outputs) <= self.ifr_intermediate_count:
+            return intermediate_outputs
+        return intermediate_outputs[-self.ifr_intermediate_count:]
+
+    def _fuse_ifr_features(self, feat_all_attn_input, final_output,
+                           intermediate_outputs):
+        if (not self.use_ifr_intermediates) or len(intermediate_outputs) == 0:
+            return final_output.features
+        if self.ifr_fusion is None:
+            fused_features = []
+            for view_id in range(len(final_output.features)):
+                terms = [final_output.features[view_id]]
+                for inter in intermediate_outputs:
+                    terms.append(inter.features[view_id])
+                feat = terms[0]
+                for term in terms[1:]:
+                    feat = feat + term
+                fused_features.append(feat / len(terms))
+            return fused_features
+        selected_intermediates = self._select_intermediate_outputs(
+            intermediate_outputs)
+        fused_features = []
+        total_views = len(final_output.features)
+        for view_id in range(total_views):
+            terms = []
+            if self.ifr_use_encoder_feature:
+                terms.append(feat_all_attn_input[:, view_id])
+            for inter in selected_intermediates:
+                terms.append(inter.features[view_id])
+            terms.append(final_output.features[view_id])
+            if len(terms) != self.ifr_fusion_num_terms:
+                feat = terms[0]
+                for term in terms[1:]:
+                    feat = feat + term
+                fused_features.append(feat / len(terms))
+            else:
+                fused = self.ifr_fusion(torch.cat(terms, dim=1))
+                fused_features.append(fused)
+        return fused_features
+
     def apply_mapanything_cross_attn(self, img_feats, sensor2keyegos,
                                      ego2globals, intrins, post_rots,
                                      post_trans, bda):
@@ -151,13 +288,31 @@ class BEVDet4DMapAnythingCrossAttn(BEVDet4D):
 
         features = [feat_all_attn_input[:, view_id].contiguous()
                     for view_id in range(total_views)]
+        scale_token = None
+        register_tokens = None
+        if self.use_token_features:
+            scale_token, register_tokens = self._build_additional_tokens(
+                feat_all_attn_input)
         output = self.mapanything_cross_attn(
-            MultiViewTransformerInput(features=features))
+            MultiViewTransformerInput(
+                features=features,
+                additional_input_tokens=scale_token,
+                additional_input_tokens_per_view=register_tokens))
         if isinstance(output, tuple):
-            output = output[0]
+            final_output, intermediate_outputs = output
+            output_features = self._fuse_ifr_features(
+                feat_all_attn_input, final_output, intermediate_outputs)
         elif isinstance(output, list):
-            output = output[-1]
-        attn_all = torch.stack(output.features, dim=1)
+            if self.use_ifr_intermediates and len(output) > 0:
+                final_output = output[-1]
+                intermediate_outputs = output[:-1]
+                output_features = self._fuse_ifr_features(
+                    feat_all_attn_input, final_output, intermediate_outputs)
+            else:
+                output_features = output[-1].features
+        else:
+            output_features = output.features
+        attn_all = torch.stack(output_features, dim=1)
         feat_all = feat_all_orig + attn_all
         feat_all = feat_all.view(b, num_frame, n, c, h, w)
         return [feat.contiguous() for feat in feat_all.unbind(dim=1)]
